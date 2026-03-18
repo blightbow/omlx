@@ -51,6 +51,11 @@ def _get_find_matching_dmg():
     sys.modules["omlx._version"] = version_mod
 
     try:
+        # Save omlx_app modules before replacing them so the finally block
+        # can restore the original state (prevents polluting later tests).
+        for mod in ("omlx_app.app", "omlx_app", "omlx_app.config", "omlx_app.server_manager"):
+            saved[mod] = sys.modules.get(mod)
+
         # Remove cached omlx_app.app module to force reimport
         sys.modules.pop("omlx_app.app", None)
         sys.modules.pop("omlx_app", None)
