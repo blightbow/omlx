@@ -7,63 +7,37 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-class TestCompiledForwardWrapper:
-    """Tests for _CompiledForward wrapper class."""
-
-    def test_compiled_forward_delegates_attributes(self):
-        """Wrapper should delegate attribute access to the inner module."""
-        from omlx.models.embedding import _CompiledForward
-
-        mock_module = MagicMock()
-        mock_module.config = MagicMock(hidden_size=384)
-        mock_module.__call__ = MagicMock(return_value="output")
-
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = MagicMock(return_value="output")
-            wrapper = _CompiledForward(mock_module)
-
-        assert wrapper.config is mock_module.config
-        assert wrapper.config.hidden_size == 384
-
-    def test_compiled_forward_call_uses_compiled(self):
-        """Wrapper __call__ should use the compiled function."""
-        from omlx.models.embedding import _CompiledForward
-
-        mock_module = MagicMock()
-        mock_compiled = MagicMock(return_value="compiled_output")
-
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = mock_compiled
-            wrapper = _CompiledForward(mock_module)
-
-        result = wrapper("input1", key="val")
-        mock_compiled.assert_called_once_with("input1", key="val")
-        assert result == "compiled_output"
-
-
 class TestTryCompile:
-    """Tests for _try_compile in model wrappers."""
+    """Tests for _try_compile() primitive-output compile path.
+
+    After c9d67d6 the _CompiledForward wrapper class was replaced by an
+    inline _compiled_embed closure stored on self._compiled_embed.  The
+    raw self.model is never wrapped.
+    """
 
     def test_try_compile_success(self):
-        """Should set _is_compiled=True on successful compilation."""
-        from omlx.models.embedding import MLXEmbeddingModel, _CompiledForward
+        """Should return True and populate _compiled_embed."""
+        from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel("test-model")
         mock_raw_model = MagicMock()
-        mock_raw_model.__call__ = MagicMock(return_value=MagicMock())
         model.model = mock_raw_model
 
+        mock_compiled_fn = MagicMock(return_value=MagicMock())
+
         with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = MagicMock(return_value=MagicMock())
+            mock_mx.compile.return_value = mock_compiled_fn
             mock_mx.zeros.return_value = MagicMock()
             mock_mx.int32 = "int32"
             result = model._try_compile()
 
         assert result is True
-        assert isinstance(model.model, _CompiledForward)
+        assert model._compiled_embed is mock_compiled_fn
+        # model.model must remain the original unwrapped model
+        assert model.model is mock_raw_model
 
-    def test_try_compile_failure_reverts(self):
-        """Should revert to original model on compilation failure."""
+    def test_try_compile_failure_leaves_model_unchanged(self):
+        """Should revert to uncompiled state on compilation failure."""
         from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel("test-model")
@@ -75,7 +49,27 @@ class TestTryCompile:
             result = model._try_compile()
 
         assert result is False
+        assert model._is_compiled is False
+        assert model._compiled_embed is None
         assert model.model is original_model
+
+    def test_try_compile_warmup_failure_reverts(self):
+        """If compile succeeds but warmup forward pass fails, revert."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+
+        mock_compiled_fn = MagicMock(side_effect=RuntimeError("eval error"))
+
+        with patch("omlx.models.embedding.mx") as mock_mx:
+            mock_mx.compile.return_value = mock_compiled_fn
+            mock_mx.zeros.return_value = MagicMock()
+            mock_mx.int32 = "int32"
+            result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_embed is None
 
 
 class TestEmbeddingEngineKeepalive:
