@@ -20,7 +20,7 @@ from omlx.cache.paged_cache import (
     PagedCacheManager,
     compute_block_hash,
 )
-from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
+from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry, _MRUPartialBlock
 from omlx.cache.stats import PrefixCacheStats
 
 
@@ -2033,3 +2033,254 @@ class TestWalkBackTruncation:
 
         # block2 ref_count should have been decremented
         assert block2.ref_count == 1
+
+
+class TestMRUPartialBlock:
+    """Tests for the MRU (most-recently-used) partial block cache.
+
+    The MRU partial block is a single-slot in-memory cache that holds the
+    trailing sub-block tail from the previous store_cache call.  It allows
+    exact-repeat requests to skip re-prefilling the tail tokens.
+    """
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_model(self):
+        return MockModel(num_layers=2)
+
+    @pytest.fixture
+    def prefix_cache(self, mock_model, paged_cache):
+        return BlockAwarePrefixCache(
+            model=mock_model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+    def test_init_mru_partial_is_none(self, prefix_cache):
+        """MRU partial starts as None."""
+        assert prefix_cache._mru_partial is None
+
+    def test_stash_partial_on_store(self, prefix_cache):
+        """store_cache stashes the trailing partial when tokens don't fill a block."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        # 6 tokens with block_size=4 → 1 full block + 2 trailing
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [
+            {
+                "state": (mx.ones((1, 1, 6, 4)), mx.ones((1, 1, 6, 4))),
+                "cache_type": "KVCache",
+            }
+            for _ in range(2)
+        ]
+
+        prefix_cache.store_cache("req-001", tokens, cache_data)
+
+        partial = prefix_cache._mru_partial
+        assert partial is not None
+        assert partial.tokens == [50, 60]
+        assert len(partial.kv_data) == 2  # 2 layers
+
+    def test_no_stash_when_block_aligned(self, prefix_cache):
+        """store_cache clears MRU partial when tokens exactly fill blocks."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        # 4 tokens with block_size=4 → exactly 1 block, no tail
+        tokens = [10, 20, 30, 40]
+        cache_data = [
+            {
+                "state": (mx.ones((1, 1, 4, 4)), mx.ones((1, 1, 4, 4))),
+                "cache_type": "KVCache",
+            }
+            for _ in range(2)
+        ]
+
+        prefix_cache.store_cache("req-001", tokens, cache_data)
+        assert prefix_cache._mru_partial is None
+
+    def test_apply_mru_partial_exact_match(self, prefix_cache, paged_cache):
+        """apply_mru_partial splices KV data when tokens match exactly."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        # Set up a block table with one block
+        block_table = paged_cache.create_block_table("req-apply")
+        block = paged_cache.allocate_block()
+        block.block_hash = b"parent_hash_001"
+        block.token_count = 4
+        block_table.block_ids.append(block.block_id)
+        block_table.num_tokens = 4
+
+        # Create a mock reconstructed cache (2 layers of KVCache-like objects)
+        class MockKVCache:
+            def __init__(self, seq_len):
+                self.keys = mx.ones((1, 1, seq_len, 4))
+                self.values = mx.ones((1, 1, seq_len, 4))
+                self.offset = seq_len
+
+        cache = [MockKVCache(4), MockKVCache(4)]
+
+        # Stash a partial that chains from this block
+        prefix_cache._mru_partial = _MRUPartialBlock(
+            parent_hash=b"parent_hash_001",
+            tokens=[50, 60],
+            kv_data=[
+                (mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))),
+                (mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))),
+            ],
+        )
+
+        remaining = [50, 60]
+        result_cache, new_remaining, applied = prefix_cache.apply_mru_partial(
+            cache, block_table, remaining,
+        )
+
+        assert applied == 2
+        assert new_remaining == []
+        assert result_cache[0].offset == 6
+        assert result_cache[0].keys.shape[2] == 6
+
+    def test_apply_mru_partial_prefix_match(self, prefix_cache, paged_cache):
+        """apply_mru_partial works when remaining tokens extend past the partial."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        block_table = paged_cache.create_block_table("req-prefix")
+        block = paged_cache.allocate_block()
+        block.block_hash = b"hash_002"
+        block.token_count = 4
+        block_table.block_ids.append(block.block_id)
+        block_table.num_tokens = 4
+
+        class MockKVCache:
+            def __init__(self, seq_len):
+                self.keys = mx.ones((1, 1, seq_len, 4))
+                self.values = mx.ones((1, 1, seq_len, 4))
+                self.offset = seq_len
+
+        cache = [MockKVCache(4), MockKVCache(4)]
+
+        prefix_cache._mru_partial = _MRUPartialBlock(
+            parent_hash=b"hash_002",
+            tokens=[50, 60],
+            kv_data=[
+                (mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))),
+                (mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))),
+            ],
+        )
+
+        # Remaining has [50, 60, 70] — partial covers [50, 60], leaving [70]
+        remaining = [50, 60, 70]
+        _, new_remaining, applied = prefix_cache.apply_mru_partial(
+            cache, block_table, remaining,
+        )
+
+        assert applied == 2
+        assert new_remaining == [70]
+
+    def test_apply_mru_partial_evicts_on_hash_mismatch(self, prefix_cache, paged_cache):
+        """MRU partial is evicted when parent hash doesn't chain."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        block_table = paged_cache.create_block_table("req-evict")
+        block = paged_cache.allocate_block()
+        block.block_hash = b"actual_hash"
+        block.token_count = 4
+        block_table.block_ids.append(block.block_id)
+        block_table.num_tokens = 4
+
+        prefix_cache._mru_partial = _MRUPartialBlock(
+            parent_hash=b"wrong_hash",
+            tokens=[50, 60],
+            kv_data=[(mx.zeros((1,)), mx.zeros((1,)))],
+        )
+
+        _, remaining, applied = prefix_cache.apply_mru_partial(
+            [], block_table, [50, 60],
+        )
+
+        assert applied == 0
+        assert remaining == [50, 60]
+        assert prefix_cache._mru_partial is None  # evicted
+
+    def test_apply_mru_partial_evicts_on_token_mismatch(self, prefix_cache, paged_cache):
+        """MRU partial is evicted when remaining tokens don't match."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        block_table = paged_cache.create_block_table("req-tok")
+        block = paged_cache.allocate_block()
+        block.block_hash = b"good_hash"
+        block.token_count = 4
+        block_table.block_ids.append(block.block_id)
+        block_table.num_tokens = 4
+
+        prefix_cache._mru_partial = _MRUPartialBlock(
+            parent_hash=b"good_hash",
+            tokens=[50, 60],
+            kv_data=[(mx.zeros((1,)), mx.zeros((1,)))],
+        )
+
+        # remaining starts with [99, 60] — doesn't match [50, 60]
+        _, remaining, applied = prefix_cache.apply_mru_partial(
+            [], block_table, [99, 60],
+        )
+
+        assert applied == 0
+        assert prefix_cache._mru_partial is None  # evicted
+
+    def test_apply_mru_partial_noop_when_none(self, prefix_cache, paged_cache):
+        """apply_mru_partial is a no-op when no partial is stashed."""
+        block_table = paged_cache.create_block_table("req-none")
+
+        cache, remaining, applied = prefix_cache.apply_mru_partial(
+            [], block_table, [50, 60],
+        )
+
+        assert applied == 0
+        assert remaining == [50, 60]
+
+    def test_stash_replaced_on_new_store(self, prefix_cache):
+        """Each store_cache replaces the previous MRU partial."""
+        try:
+            import mlx.core as mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+        for req_id, tail_token in [("req-a", 50), ("req-b", 99)]:
+            tokens = [10, 20, 30, 40, tail_token]  # 1 block + 1 trailing
+            cache_data = [
+                {
+                    "state": (mx.ones((1, 1, 5, 4)), mx.ones((1, 1, 5, 4))),
+                    "cache_type": "KVCache",
+                }
+                for _ in range(2)
+            ]
+            prefix_cache.store_cache(req_id, tokens, cache_data)
+
+        # Only the latest partial is retained
+        assert prefix_cache._mru_partial is not None
+        assert prefix_cache._mru_partial.tokens == [99]

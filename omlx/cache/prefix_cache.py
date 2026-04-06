@@ -33,6 +33,29 @@ _PrefillReadyRotatingKVCache = None  # Lazily initialized RotatingKVCache subcla
 
 
 @dataclass
+class _MRUPartialBlock:
+    """Most-recently-used trailing partial block kept in memory.
+
+    Holds the KV state for the sub-block tail that cannot be persisted to
+    the paged SSD cache (which requires full blocks).  A single slot is
+    retained and silently replaced on every ``store_cache`` call that
+    produces a new trailing partial.
+
+    Attributes:
+        parent_hash: Block hash of the last full block preceding this
+            partial.  Used to verify the partial chains from the correct
+            prefix during ``apply_mru_partial``.
+        tokens: Token IDs in the partial block (length < block_size).
+        kv_data: Per-layer ``(keys, values)`` tensor slices covering
+            exactly ``len(tokens)`` positions.
+    """
+
+    parent_hash: Optional[bytes]
+    tokens: List[int]
+    kv_data: List[Tuple[Any, Any]]
+
+
+@dataclass
 class BlockCacheEntry:
     """Entry mapping a token sequence to cache blocks."""
 
@@ -106,6 +129,10 @@ class BlockAwarePrefixCache(CacheManager):
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
         self._cold_restore_callback: Optional[Callable[[int, bytes], bool]] = None
+
+        # MRU partial block: single-slot in-memory cache for the trailing
+        # sub-block tail.  Replaced on every store_cache, evicted on miss.
+        self._mru_partial: Optional[_MRUPartialBlock] = None
 
         # Statistics
         self._hits = 0
@@ -557,6 +584,54 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+        # Stash the trailing partial block in memory (single-slot MRU).
+        # This allows exact-repeat requests to skip re-prefilling the tail.
+        if trailing_partial_tokens > 0 and is_tensor_data and HAS_MLX:
+            partial_start = num_new_blocks * self.block_size
+            partial_global_start = existing_tokens + partial_start
+            partial_global_end = existing_tokens + partial_start + trailing_partial_tokens
+
+            cache_seq_len = self._get_cache_seq_len(cache_data)
+            cache_uses_global_indices = (
+                existing_tokens > 0 and cache_seq_len >= (existing_tokens + 1)
+            )
+            if cache_uses_global_indices:
+                p_cache_start = partial_global_start
+                p_cache_end = partial_global_end
+            else:
+                p_cache_start = partial_start
+                p_cache_end = partial_start + trailing_partial_tokens
+
+            partial_kv = self._extract_block_tensor_slice(
+                cache_data, p_cache_start, p_cache_end, model_cache_config,
+                is_last_block=True,
+            )
+            if partial_kv:
+                # Determine parent hash from the last full block
+                parent_hash = None
+                if block_table.block_ids:
+                    last_bid = block_table.block_ids[-1]
+                    last_block = self.paged_cache.allocated_blocks.get(last_bid)
+                    if last_block and last_block.block_hash:
+                        parent_hash = last_block.block_hash
+
+                partial_tokens = new_tokens[partial_start:]
+                self._mru_partial = _MRUPartialBlock(
+                    parent_hash=parent_hash,
+                    tokens=partial_tokens,
+                    kv_data=partial_kv,
+                )
+                logger.debug(
+                    "Stashed MRU partial block: %d tokens, parent_hash=%s",
+                    len(partial_tokens),
+                    parent_hash[:8].hex() + "..." if parent_hash else "None",
+                )
+            else:
+                self._mru_partial = None
+        else:
+            # No trailing partial (or non-tensor data) — clear any stale entry.
+            self._mru_partial = None
 
         # Update prefix index
         self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
@@ -1705,6 +1780,88 @@ class BlockAwarePrefixCache(CacheManager):
             import traceback
             logger.debug(traceback.format_exc())
             return None
+
+    def apply_mru_partial(
+        self,
+        cache: List[Any],
+        block_table: BlockTable,
+        remaining_tokens: List[int],
+    ) -> Tuple[List[Any], List[int], int]:
+        """Splice the MRU partial block into a reconstructed cache.
+
+        If the single-slot MRU partial matches (parent hash chains from the
+        last block and remaining tokens start with the partial's tokens),
+        the partial's KV data is concatenated onto the reconstructed cache
+        objects and ``remaining_tokens`` is shortened accordingly.
+
+        On a miss the MRU slot is evicted so stale data never accumulates.
+
+        Args:
+            cache: Reconstructed cache list from ``reconstruct_cache``.
+            block_table: The block table returned by ``fetch_cache``.
+            remaining_tokens: Tokens still needing prefill.
+
+        Returns:
+            ``(cache, remaining_tokens, tokens_applied)`` — *cache* and
+            *remaining_tokens* are updated in-place when the partial
+            matches; *tokens_applied* is 0 on miss.
+        """
+        partial = self._mru_partial
+        if partial is None or not remaining_tokens:
+            return cache, remaining_tokens, 0
+
+        # --- Parent-hash chain check ---
+        if block_table and block_table.block_ids:
+            last_bid = block_table.block_ids[-1]
+            last_block = self.paged_cache.allocated_blocks.get(last_bid)
+            last_hash = last_block.block_hash if last_block else None
+        else:
+            last_hash = None
+
+        if partial.parent_hash != last_hash:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        # --- Token prefix check ---
+        n_partial = len(partial.tokens)
+        if len(remaining_tokens) < n_partial:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+        if remaining_tokens[:n_partial] != partial.tokens:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        # --- Splice KV data onto each layer ---
+        if len(partial.kv_data) != len(cache):
+            logger.debug(
+                "MRU partial layer count mismatch: %d vs %d, skipping",
+                len(partial.kv_data), len(cache),
+            )
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        try:
+            for layer_idx, (p_keys, p_values) in enumerate(partial.kv_data):
+                cache_obj = cache[layer_idx]
+                # Only splice into sliceable caches (standard KVCache).
+                # RotatingKVCache/ArraysCache store full state and cannot
+                # be extended with a simple concatenation.
+                if not (hasattr(cache_obj, 'keys') and hasattr(cache_obj, 'offset')):
+                    continue
+                cache_obj.keys = mx.concatenate([cache_obj.keys, p_keys], axis=2)
+                cache_obj.values = mx.concatenate([cache_obj.values, p_values], axis=2)
+                cache_obj.offset += n_partial
+        except Exception as e:
+            logger.debug("MRU partial splice failed: %s", e)
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        new_remaining = remaining_tokens[n_partial:]
+        logger.debug(
+            "Applied MRU partial block: %d tokens, %d remaining",
+            n_partial, len(new_remaining),
+        )
+        return cache, new_remaining, n_partial
 
     def _fallback_reconstruct_layer(
         self,

@@ -2164,6 +2164,19 @@ class Scheduler:
                     request.shared_prefix_blocks = len(block_table.block_ids)
                     # Recalculate remaining_tokens in case block_table was truncated
                     request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+
+                    # Try to extend the cache with the MRU partial block
+                    # (in-memory sub-block tail from the previous request).
+                    if request.remaining_tokens:
+                        reconstructed, request.remaining_tokens, partial_applied = (
+                            self.block_aware_cache.apply_mru_partial(
+                                reconstructed, block_table, request.remaining_tokens,
+                            )
+                        )
+                        if partial_applied > 0:
+                            request.prompt_cache = reconstructed
+                            request.cached_tokens += partial_applied
+
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
