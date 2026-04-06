@@ -2438,6 +2438,7 @@ async def stream_chat_completion(
     """
     start_time = time.perf_counter()
     first_token_time = None
+    first_chunk_yielded_time = None
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
@@ -2469,6 +2470,8 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    if not stream_content:
+        logger.debug("stream_content=False (has_tools=%s, filter inactive)", has_tools)
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -2497,6 +2500,12 @@ async def stream_chat_completion(
                         )],
                     )
                     if thinking_delta:
+                        if first_chunk_yielded_time is None:
+                            first_chunk_yielded_time = time.perf_counter()
+                            logger.debug(
+                                "First SSE chunk yielded: %.3fs after TTFT (reasoning_content)",
+                                first_chunk_yielded_time - (first_token_time or start_time),
+                            )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
                 # Emit content delta — filter out tool-call markup when
@@ -2505,14 +2514,12 @@ async def stream_chat_completion(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[ChatCompletionChunkChoice(
-                                delta=ChatCompletionChunkDelta(content=content_delta),
-                                finish_reason=None,
-                            )],
-                        )
+                        if first_chunk_yielded_time is None:
+                            first_chunk_yielded_time = time.perf_counter()
+                            logger.debug(
+                                "First SSE chunk yielded: %.3fs after TTFT (content)",
+                                first_chunk_yielded_time - (first_token_time or start_time),
+                            )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
