@@ -332,6 +332,8 @@ def extract_text_content(
             msg_dict = {"role": role, "content": content if content else ""}
             if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
+            if getattr(msg, "partial", False):
+                msg_dict["partial"] = True
 
             # Preserve structured tool_calls for models with native tool calling
             # so the chat template renders them in the model's native format.
@@ -488,6 +490,8 @@ def extract_multimodal_content(
             msg_dict = {"role": role, "content": content if content else ""}
             if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
+            if getattr(msg, "partial", False):
+                msg_dict["partial"] = True
 
             if getattr(tokenizer, "has_tool_calling", False):
                 tool_calls_list = []
