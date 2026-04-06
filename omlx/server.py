@@ -2444,6 +2444,12 @@ async def stream_chat_completion(
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
+    # Debug: write a copy of every SSE chunk to a sidecar file
+    _sse_debug_path = f"/tmp/omlx_sse_debug_{int(start_time)}.txt"
+    _sse_debug_f = open(_sse_debug_path, "w")
+    _sse_chunks_written = 0
+    logger.debug("SSE debug log: %s", _sse_debug_path)
+
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # First chunk with role
@@ -2454,7 +2460,10 @@ async def stream_chat_completion(
             delta=ChatCompletionChunkDelta(role="assistant"),
         )],
     )
-    yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
+    _first_chunk_sse = f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
+    _sse_debug_f.write(_first_chunk_sse)
+    _sse_chunks_written += 1
+    yield _first_chunk_sse
 
     # Stream content token-by-token. When tools are present, a
     # ToolCallStreamFilter suppresses known tool-call control markup so
@@ -2506,7 +2515,10 @@ async def stream_chat_completion(
                                 "First SSE chunk yielded: %.3fs after TTFT (reasoning_content)",
                                 first_chunk_yielded_time - (first_token_time or start_time),
                             )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        _sse_line = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        _sse_debug_f.write(_sse_line)
+                        _sse_chunks_written += 1
+                        yield _sse_line
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
@@ -2520,7 +2532,10 @@ async def stream_chat_completion(
                                 "First SSE chunk yielded: %.3fs after TTFT (content)",
                                 first_chunk_yielded_time - (first_token_time or start_time),
                             )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        _sse_line = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        _sse_debug_f.write(_sse_line)
+                        _sse_chunks_written += 1
+                        yield _sse_line
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
         error_data = {
@@ -2715,6 +2730,11 @@ async def stream_chat_completion(
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 
+    _sse_debug_f.write("data: [DONE]\n\n")
+    _sse_debug_f.write(f"\n# {_sse_chunks_written} SSE chunks yielded, "
+                       f"accumulated_text length={len(accumulated_text)}\n")
+    _sse_debug_f.close()
+    logger.debug("SSE debug: %d chunks written to %s", _sse_chunks_written, _sse_debug_path)
     yield "data: [DONE]\n\n"
 
 
