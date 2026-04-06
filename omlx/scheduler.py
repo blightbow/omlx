@@ -3624,8 +3624,23 @@ class Scheduler:
         if self._deferred_clear_steps is not None:
             self._deferred_clear_steps += 1
             if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
-                should_clear = True
-                self._deferred_clear_steps = None
+                # Suppress the deferred clear when an MRU partial block
+                # exists.  The partial is a strong signal that the same
+                # prompt will be resubmitted; clearing the Metal cache now
+                # would force the next request to re-materialize all lazy
+                # KV tensors from SSD, adding seconds of avoidable TTFT.
+                # The clear is deferred until the MRU is consumed or evicted.
+                if (
+                    self.block_aware_cache is not None
+                    and getattr(self.block_aware_cache, '_mru_partial', None) is not None
+                ):
+                    # Keep the counter armed so it re-checks each step.
+                    # Once the MRU partial is consumed or evicted, the
+                    # clear will fire on the next step.
+                    pass
+                else:
+                    should_clear = True
+                    self._deferred_clear_steps = None
         if should_clear:
             _sync_and_clear_cache()
         if (
