@@ -2473,6 +2473,10 @@ async def stream_chat_completion(
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
+                logger.debug(
+                    "TTFT: %.3fs (from stream_chat_completion entry)",
+                    first_token_time - start_time,
+                )
             last_output = output
             if output.new_text:
                 accumulated_text += output.new_text
