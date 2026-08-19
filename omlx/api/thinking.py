@@ -92,10 +92,40 @@ def _think_end_token_ids(tokenizer) -> list[int] | None:
     return None
 
 
+def _partial_content_opens_thinking(
+    content: str,
+    think_tag: str,
+    think_end_tag: str,
+) -> bool | None:
+    """Return whether a partial prefill leaves a thinking block open.
+
+    ``None`` means the prefill carries no thinking markers at all, so the
+    caller should fall back to inspecting the rendered prompt tail.
+    """
+    normalized = (
+        content.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG)
+        .replace(_MINIMAX_CLOSE_TAG, _CLOSE_TAG)
+        .replace(_HY3_OPEN_TAG, _OPEN_TAG)
+        .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
+    )
+
+    last_open = max(
+        normalized.rfind(tag) for tag in {think_tag, _OPEN_TAG} if tag
+    )
+    last_close = max(
+        normalized.rfind(tag) for tag in {think_end_tag, _CLOSE_TAG} if tag
+    )
+
+    if last_open < 0 and last_close < 0:
+        return None
+    return last_open > last_close
+
+
 def prompt_opens_thinking(
     tokenizer,
     prompt: str,
     prompt_token_ids: Sequence[int] | None = None,
+    partial_content: str | None = None,
 ) -> tuple[bool, str]:
     """Return whether a raw prompt would make the engine prepend ``<think>``.
 
@@ -105,10 +135,32 @@ def prompt_opens_thinking(
     the think-start token in the final token tail without the raw string ending
     in the visible tag. When the caller already has prompt ids from the same
     tokenizer path as the scheduler, those ids are authoritative.
+
+    ``partial_content`` is the text of the final message when partial mode is
+    completing it. That message is the only place a prefill can leave a block
+    open, so its markers decide the answer on their own: markers elsewhere in
+    the prompt belong to turns the template has already closed, and reading
+    them would let history escape the boundary partial mode manages. Checking
+    the text directly is sound here because the opener is caller-supplied
+    rather than synthesised by the template, and it keeps the cost tied to the
+    prefill rather than to the length of the chat. A prefill with no markers
+    falls through to the token tail below, so a template that opens thinking
+    on its own is still detected.
     """
     think_tag = (
         _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
     )
+
+    if partial_content:
+        think_end_tag = (
+            _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG) or _CLOSE_TAG
+        )
+        opened = _partial_content_opens_thinking(
+            partial_content, think_tag, think_end_tag
+        )
+        if opened is not None:
+            return opened, think_tag
+
     if tokenizer is None:
         return prompt.rstrip().endswith(think_tag), think_tag
 

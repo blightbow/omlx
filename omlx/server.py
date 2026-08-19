@@ -4497,6 +4497,26 @@ def _copy_chat_template_messages(messages: list) -> list:
     ]
 
 
+def _partial_prefill_content(messages: list, kwargs: dict) -> str | None:
+    """Return the final message's text when partial mode is completing it.
+
+    Partial mode continues the last message rather than starting a new turn, so
+    that message holds the only thinking markers that can still be open when
+    generation begins. Handing just its text to the detector keeps history
+    markers out of the decision and keeps the scan proportional to the prefill
+    instead of to the whole conversation.
+    """
+    if not kwargs.get("is_partial") or not messages:
+        return None
+
+    last_message = messages[-1]
+    if not isinstance(last_message, dict):
+        return None
+
+    content = last_message.get("content")
+    return content if isinstance(content, str) else None
+
+
 def _render_chat_prompt_for_thinking_detection(
     engine: BaseEngine,
     messages: list,
@@ -4584,7 +4604,10 @@ async def stream_chat_completion(
                 engine, messages, kwargs
             )
             start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                tokenizer,
+                prompt,
+                prompt_token_ids=prompt_token_ids,
+                partial_content=_partial_prefill_content(messages, kwargs),
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
@@ -5030,7 +5053,10 @@ async def stream_anthropic_messages(
                 engine, messages, kwargs
             )
             start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                tokenizer,
+                prompt,
+                prompt_token_ids=prompt_token_ids,
+                partial_content=_partial_prefill_content(messages, kwargs),
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
@@ -6374,7 +6400,10 @@ async def stream_responses_api(
                     engine, messages, kwargs
                 )
                 start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                    tokenizer,
+                    prompt,
+                    prompt_token_ids=prompt_token_ids,
+                    partial_content=_partial_prefill_content(messages, kwargs),
                 )
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)

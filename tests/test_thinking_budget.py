@@ -733,6 +733,91 @@ class TestCompletionsStreamThinkPrefixParity:
 
         assert prompt_opens_thinking(None, "literal <think>\n") == (True, "<think>")
 
+    def test_partial_prefill_opens_thinking_with_trailing_prose(self):
+        """A prefill may continue well past its own <think>, so the opener is
+        nowhere near the token tail. Reading the prefill directly is what keeps
+        the reasoning routed to reasoning_content instead of leaking as content
+        with the model's </think> silently discarded."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [41, 500, 501, 502]
+
+        opens, tag = prompt_opens_thinking(
+            Tokenizer(),
+            "rendered prompt",
+            partial_content="<think>\nIt's been ten days since I ",
+        )
+
+        assert (opens, tag) == (True, "<think>")
+
+    def test_partial_prefill_with_closed_block_does_not_open_thinking(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [41, 500, 42, 501]
+
+        opens, tag = prompt_opens_thinking(
+            Tokenizer(),
+            "rendered prompt",
+            partial_content="<think>done</think>Now the answer",
+        )
+
+        assert (opens, tag) == (False, "<think>")
+
+    def test_partial_prefill_without_markers_falls_back_to_token_tail(self):
+        """A template can still open thinking on its own while continuing a
+        message, so a marker-free prefill must not suppress the tail check."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [100, 41, 99]
+
+        opens, tag = prompt_opens_thinking(
+            Tokenizer(),
+            "templated suffix",
+            partial_content="It's been ten days since I ",
+        )
+
+        assert (opens, tag) == (True, "<think>")
+
+    def test_prompt_detection_ignores_history_markers_outside_the_prefill(self):
+        """Markers from earlier turns belong to blocks the template already
+        closed. Partial mode only completes the final message, so history must
+        not decide whether generation starts inside a thinking block."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [41, 700, 800, 801]
+
+        opens, tag = prompt_opens_thinking(
+            Tokenizer(),
+            "<think>earlier turn reasoning ... Now the answer",
+            partial_content="Continuing without markers",
+        )
+
+        assert (opens, tag) == (False, "<think>")
+
     def test_stream_completion_wires_the_strip(self):
         """Structural guard: the streaming handler must call the strip
         helper, or the prefix leaks back on the first chunk."""
